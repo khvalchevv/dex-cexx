@@ -1,0 +1,349 @@
+"""Token universe builder for CEX-CEX arbitrage.
+
+Grouping rule (two passes via Union-Find):
+
+  Pass 1 — TICKER: same uppercase ticker on different exchanges = same asset.
+    All BTC listings unite; all WBTC listings unite; etc.
+
+  Pass 2 — CROSS-TICKER ALIAS via EXACT LOWERCASED NAME: when two exchanges
+    label the same on-chain asset with different display tickers — like
+    Ronin's native token traded as "RON" on some CEX and "RONIN" on others —
+    union them. Both have project name "Ronin", a raw exact match. Crucially
+    NO stopword stripping: "Wrapped Ronin" stays distinct from "Ronin", and
+    "Ethena USD" / "World Liberty Financial USD" stay distinct from "Ethena"
+    / "World Liberty Financial" — those are different on-chain assets that
+    just share part of the name.
+
+Group id = most common ticker in the merged component. Display = first
+non-empty project name. Contract + network data are carried per-listing for
+the alert but do NOT drive grouping (a token can have different contracts
+across networks but still be the same asset).
+
+No CoinGecko, no median price filter — both rejected by design.
+"""
+import asyncio
+import json
+import logging
+import os
+import time
+
+from dex_watcher import _norm_net, _norm_contract
+
+log = logging.getLogger(__name__)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+UNIVERSE_FILE = os.path.join(_HERE, "token_universe.json")
+REBUILD_INTERVAL_SEC = int(os.getenv("UNIVERSE_REBUILD_SEC", str(24 * 3600)))
+UNIVERSE_MAX_AGE_SEC = int(os.getenv("UNIVERSE_MAX_AGE_SEC", str(48 * 3600)))
+
+# Ticker prefixes that indicate a wrapper/staking variant — used for the
+# alert's "wrap_kind" badge ONLY, not for grouping. Longest-first.
+_WRAP_PREFIXES = ("WST", "BST", "WB", "ST", "WS", "BB", "BE", "W", "S", "B", "M", "R")
+_MIN_BASE_LEN = 3  # don't strip past "SUI" -> "UI"
+
+
+def wrap_info(symbol: str) -> tuple[str, str | None]:
+    """Return (base_symbol, wrap_kind). wrap_kind in {w, st, s, ...} or None.
+    Display-only: the scanner does NOT group wrappers with their bases."""
+    su = symbol.upper()
+    for pfx in _WRAP_PREFIXES:
+        if su.startswith(pfx) and len(su) - len(pfx) >= _MIN_BASE_LEN:
+            return su[len(pfx):], pfx.lower()
+    return su, None
+
+
+def _norm(exch_id: str) -> str:
+    return exch_id.partition("#")[0]
+
+
+class _UF:
+    """Union-Find over listing indices."""
+    def __init__(self, n: int):
+        self.p = list(range(n))
+
+    def find(self, x: int) -> int:
+        while self.p[x] != x:
+            self.p[x] = self.p[self.p[x]]
+            x = self.p[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.p[rb] = ra
+
+
+def _norm_key(name: str) -> str:
+    """Lowercase + strip 'wrapped' token. 'Wrapped Ronin' → 'ronin'."""
+    return " ".join(t for t in name.strip().lower().split() if t != "wrapped")
+
+
+def _listing_cc(lst) -> list[tuple[str, str]]:
+    """Listing's (normalized_chain, normalized_contract) pairs."""
+    out = []
+    for net, nd in (lst.get("networks") or {}).items():
+        c = _norm_contract(nd.get("contract") or "")
+        if c and len(c) > 6:
+            out.append((_norm_net(net) or "?" + (net or "").lower(), c))
+    return out
+
+
+def _is_wrap_pair(t1: set, t2: set) -> bool:
+    """True if the two ticker-sets are a strict wrapper pair (one ticker is
+    exactly 'W'+the other, e.g. BTC/WBTC, ETH/WETH, DOG/WDOG). Those genuinely
+    track the same asset 1:1 and stay merged; everything else (SAFE/SAFE4,
+    AI/AIGENSYN, RENDER/RNDR) is a different token and must split."""
+    for a in t1:
+        for b in t2:
+            lo, hi = (a, b) if len(a) <= len(b) else (b, a)
+            if len(lo) >= 3 and hi == "W" + lo:
+                return True
+    return False
+
+
+def _build_groups(listings: list[dict]) -> list[list[int]]:
+    """Contract-identity grouping with a same-chain contract-conflict guard.
+
+      Pass A — CONTRACT: listings sharing a contract address are the same
+        token (handles multichain: each exchange's listing carries all its
+        networks, so they share at least one contract).
+      Pass B — TICKER (guarded) and Pass C — NAME_KEY (guarded): merge by
+        ticker / project-name, BUT never merge two components that hold
+        DIFFERENT contracts on the SAME chain — those are different projects
+        sharing a ticker (the two BSC "DUCKY"s; Gensyn vs SleepAI). They stay
+        as separate groups. NAME merges RON+RONIN+Wrapped-Ronin ('ronin') and
+        keeps 'Ethena' vs 'Ethena USD' apart.
+
+      FORBIDDEN-PAIR guard: an exchange is authoritative about its own
+        listings — if one exchange lists contract C1 and contract C2 under
+        DIFFERENT tickers (e.g. mexc: 0x5afe='SAFE', 0x4d7f='SAFE4'), then C1
+        and C2 are different tokens and must NEVER share a group, no matter
+        what other merges suggest. This kills the cross-token DEX fakes (a
+        wrong cross-chain contract priced as the group's token). Exception:
+        strict wrappers (W+base) stay merged. No prices involved.
+    """
+    n = len(listings)
+    uf = _UF(n)
+
+    # Forbidden contract pairs: built from each exchange's own ticker->contract
+    # assignments. If an exchange gives two contracts disjoint ticker sets,
+    # they are different tokens (unless a strict W+base wrapper pair).
+    ex_cmap: dict[str, dict[str, set]] = {}   # eid -> {contract -> set(tickers)}
+    for lst in listings:
+        eid = lst["eid"]; tk = lst["symbol"].upper()
+        for _, c in _listing_cc(lst):
+            ex_cmap.setdefault(eid, {}).setdefault(c, set()).add(tk)
+    forbidden_adj: dict[str, set] = {}          # contract -> set of contracts it must NOT merge with
+    for cmap in ex_cmap.values():
+        items = list(cmap.items())
+        for x in range(len(items)):
+            for y in range(x + 1, len(items)):
+                c1, t1 = items[x]; c2, t2 = items[y]
+                if t1 & t2:
+                    continue                    # shared ticker -> same token (alias)
+                if _is_wrap_pair(t1, t2):
+                    continue                    # BTC/WBTC etc. -> keep mergeable
+                forbidden_adj.setdefault(c1, set()).add(c2)
+                forbidden_adj.setdefault(c2, set()).add(c1)
+
+    # Pass A: union by shared contract address.
+    by_contract: dict[str, int] = {}
+    for i, lst in enumerate(listings):
+        for _, c in _listing_cc(lst):
+            if c in by_contract:
+                uf.union(by_contract[c], i)
+            else:
+                by_contract[c] = i
+
+    # Per-root chain -> set(contract) (same-chain conflicts) and the flat
+    # set of all contracts in the component (forbidden-pair check).
+    root_cc: dict[int, dict[str, set]] = {}
+    root_all: dict[int, set] = {}
+    for i, lst in enumerate(listings):
+        r = uf.find(i)
+        d = root_cc.setdefault(r, {})
+        a = root_all.setdefault(r, set())
+        for ch, c in _listing_cc(lst):
+            d.setdefault(ch, set()).add(c)
+            a.add(c)
+
+    def _conflict(a: int, b: int) -> bool:
+        ra, rb = uf.find(a), uf.find(b)
+        if ra == rb:
+            return False
+        da, db = root_cc.get(ra, {}), root_cc.get(rb, {})
+        for ch, cs in da.items():
+            ocs = db.get(ch)
+            if cs and ocs and not (cs & ocs):
+                return True       # same chain, disjoint contracts -> different projects
+        # forbidden-pair: any contract here paired with any contract there that
+        # some exchange marked as a different token -> never merge.
+        if forbidden_adj:
+            aa, ab = root_all.get(ra), root_all.get(rb)
+            if aa and ab:
+                if len(ab) < len(aa):
+                    aa, ab = ab, aa
+                for c1 in aa:
+                    partners = forbidden_adj.get(c1)
+                    if partners and (partners & ab):
+                        return True
+        return False
+
+    def _gunion(a: int, b: int) -> None:
+        if _conflict(a, b):
+            return
+        ra, rb = uf.find(a), uf.find(b)
+        if ra == rb:
+            return
+        uf.union(a, b)
+        nr = uf.find(a)
+        old = rb if nr == ra else ra
+        dst = root_cc.setdefault(nr, {})
+        for ch, cs in root_cc.get(old, {}).items():
+            dst.setdefault(ch, set()).update(cs)
+        root_all.setdefault(nr, set()).update(root_all.get(old, set()))
+
+    # Pass B: ticker (guarded).
+    by_ticker: dict[str, int] = {}
+    for i, lst in enumerate(listings):
+        t = lst["symbol"].upper()
+        if t in by_ticker:
+            _gunion(by_ticker[t], i)
+        else:
+            by_ticker[t] = i
+
+    # Pass C: project name_key (guarded).
+    by_name: dict[str, int] = {}
+    for i, lst in enumerate(listings):
+        nm = _norm_key(lst.get("name") or "")
+        if len(nm) < 2:
+            continue
+        if nm in by_name:
+            _gunion(by_name[nm], i)
+        else:
+            by_name[nm] = i
+
+    comps: dict[int, list[int]] = {}
+    for i in range(n):
+        comps.setdefault(uf.find(i), []).append(i)
+    return list(comps.values())
+
+
+class TokenUniverse:
+    def __init__(self):
+        self.groups: dict[str, dict] = {}
+        self.index: dict[tuple[str, str], str] = {}
+        self.built_ts: float = 0.0
+
+    # ---------- build ----------
+
+    def build_from_cache(self, currency_cache, ticker_names: dict) -> None:
+        listings: list[dict] = []
+        for eid, assets in currency_cache.cache.items():
+            eid = _norm(eid)
+            names = ticker_names.get(eid, {})
+            for asset, info in assets.items():
+                listings.append({
+                    "eid": eid,
+                    "symbol": asset,
+                    "name": names.get(asset, ""),
+                    "networks": info.get("networks") or {},
+                })
+        if not listings:
+            log.warning("universe: no listings in currency cache")
+            return
+
+        comps = _build_groups(listings)
+        groups: dict[str, dict] = {}
+        index: dict[tuple[str, str], str] = {}
+        for comp in comps:
+            members = [listings[i] for i in comp]
+            eids = {m["eid"] for m in members}
+            has_contract = any((nd.get("contract") or "")
+                               for m in members
+                               for nd in (m.get("networks") or {}).values())
+            # Keep a group if it's arbitrable: either >=2 CEX (CEX<->CEX), or a
+            # single CEX listing that has a contract (CEX<->DEX needs just one
+            # CEX leg + the on-chain pool). Drop single-CEX with no contract —
+            # can't pair it with anything.
+            if len(eids) < 2 and not has_contract:
+                continue
+            # group id = most common ticker in the merged component
+            tickers = [m["symbol"].upper() for m in members]
+            gid = max(set(tickers), key=tickers.count)
+            # de-dupe key collisions across truly different components
+            gkey = gid
+            suffix = 0
+            while gkey in groups:
+                suffix += 1
+                gkey = f"{gid}#{suffix}"
+            display = next((m["name"] for m in members if m["name"]), gkey)
+            lst_out = []
+            for m in members:
+                _, kind = wrap_info(m["symbol"])
+                lst_out.append({
+                    "eid": m["eid"],
+                    "symbol": m["symbol"],
+                    "name": m["name"],
+                    "wrapped": kind is not None,
+                    "wrap_kind": kind,
+                    "networks": m["networks"],
+                })
+                index[(m["eid"], m["symbol"].upper())] = gkey
+            groups[gkey] = {"display": display, "listings": lst_out}
+        self.groups = groups
+        self.index = index
+        self.built_ts = time.time()
+        log.info("universe built: %d groups from %d listings (%d exchanges)",
+                 len(groups), len(listings),
+                 len({l['eid'] for l in listings}))
+
+    # ---------- persistence ----------
+
+    def save(self) -> None:
+        try:
+            with open(UNIVERSE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"ts": self.built_ts, "groups": self.groups}, f)
+            log.info("universe saved: %d groups", len(self.groups))
+        except Exception as e:
+            log.warning("universe save err: %s", e)
+
+    def load(self) -> bool:
+        try:
+            with open(UNIVERSE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return False
+        except Exception as e:
+            log.warning("universe load err: %s", e)
+            return False
+        age = time.time() - data.get("ts", 0)
+        if age > UNIVERSE_MAX_AGE_SEC:
+            log.info("universe on disk is stale (%.1fh) — will rebuild", age / 3600)
+            return False
+        self.groups = data.get("groups", {})
+        self.built_ts = data.get("ts", 0)
+        self.index = {}
+        for gid, g in self.groups.items():
+            for lst in g["listings"]:
+                self.index[(lst["eid"], lst["symbol"].upper())] = gid
+        log.info("universe loaded from disk: %d groups (age %.1fh)",
+                 len(self.groups), age / 3600)
+        return True
+
+    # ---------- rebuild loop ----------
+
+    async def rebuild_loop(self, currency_cache, ticker_names_provider,
+                            stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(),
+                                       timeout=REBUILD_INTERVAL_SEC)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                self.build_from_cache(currency_cache, ticker_names_provider())
+                self.save()
+            except Exception as e:
+                log.exception("universe rebuild err: %s", e)
