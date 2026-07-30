@@ -28,10 +28,10 @@ log = logging.getLogger(__name__)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEX_POOLS_FILE = os.path.join(_HERE, "dex_pools.json")
 OKX_CANDLES = "https://web3.okx.com/api/v5/dex/market/candles"
-POLL_INTERVAL_SEC = int(os.getenv("DEX_POLL_INTERVAL_SEC", "20"))
+POLL_INTERVAL_SEC = int(os.getenv("DEX_POLL_INTERVAL_SEC", "0"))  # 0 = back-to-back cycles
 MIN_VOL_USD = float(os.getenv("DEX_MIN_VOL_USD", "1000"))   # 24h vol floor
-WORKER_COUNT = int(os.getenv("DEX_WORKERS", "300"))
-REQUEST_TIMEOUT = int(os.getenv("DEX_REQ_TIMEOUT", "8"))
+WORKER_COUNT = int(os.getenv("DEX_WORKERS", "1000"))
+REQUEST_TIMEOUT = int(os.getenv("DEX_REQ_TIMEOUT", "5"))
 TRACK_REFRESH_SEC = int(os.getenv("DEX_TRACK_REFRESH_SEC", "600"))
 MAX_CONTRACTS_PER_GROUP = 8
 
@@ -51,6 +51,11 @@ OKX_CHAIN_INDEX = {
     "linea": "59144", "scroll": "534352", "mantle": "5000", "blast": "81457",
     "sei": "1329", "cronos": "25", "fantom": "146", "gnosis": "100",
     "celo": "42220", "pulsechain": "369", "berachain": "80094", "abstract": "2741",
+    # newly added — may or may not exist in OKX aggregator; extras just get
+    # 51001 and prune themselves.
+    "robinhood": "4663",                                            # Robinhood Chain (Arbitrum Orbit RWA L2, mainnet 2026-07-01)
+    "klaytn": "8217", "kcc": "321", "ronin": "2020", "xdc": "50",
+    "merlin": "4200", "oktc": "66",
 }
 
 # Exchange network label -> normalized chain.
@@ -59,29 +64,37 @@ _CHAIN_ALIASES = {
     "bsc": {"bsc", "bep20", "bep-20", "bep 20", "bnb", "bscbnb", "bnb smart chain",
             "bnb chain", "binance smart chain", "binance-smart-chain", "bsc_bnb"},
     "arbitrum": {"arb", "arbone", "arbitrum", "arbitrum one", "arbitrumone", "arbi",
-                 "arbitrum-one", "arb one"},
+                 "arbitrum-one", "arb one", "arbevm", "arbeth", "arbitrumeth"},
     "solana": {"sol", "solana", "spl"},
     "polygon": {"matic", "polygon", "pol", "polygon pos", "matic mainnet"},
-    "base": {"base"},
-    "avalanche": {"avax", "avalanche", "avaxc", "avalanche c-chain", "c-chain", "avax c"},
-    "optimism": {"op", "optimism", "optimistic", "op mainnet"},
+    "base": {"base", "baseeth", "base-eth", "basechain", "basemainnet"},
+    "avalanche": {"avax", "avalanche", "avaxc", "avalanche c-chain", "c-chain", "avax c",
+                  "avaxcchain", "avaxc-chain", "avac", "ava c"},
+    "optimism": {"op", "optimism", "optimistic", "op mainnet", "optimismeth"},
     "tron": {"trx", "trc20", "trc-20", "trc 20", "tron"},
     "sui": {"sui"},
-    "ton": {"ton", "the open network", "toncoin"},
+    "ton": {"ton", "the open network", "toncoin", "openton", "ton2", "jetton"},
     "aptos": {"apt", "aptos"},
     "zksync": {"zksync", "zksync era", "zksyncera", "zksync2", "zksyncera_eth", "era", "zksera"},
-    "linea": {"linea"},
-    "scroll": {"scroll"},
-    "mantle": {"mantle"},
-    "blast": {"blast"},
+    "linea": {"linea", "lineaeth", "linea-eth", "lineamainnet"},
+    "scroll": {"scroll", "scrolleth", "scroll-eth"},
+    "mantle": {"mantle", "mnt", "mantleeth"},
+    "blast": {"blast", "blasteth", "blast-eth"},
     "sei": {"sei", "sei evm", "seievm"},
     "cronos": {"cro", "cronos"},
-    "fantom": {"ftm", "fantom", "sonic"},
+    "fantom": {"ftm", "fantom", "sonic", "s"},
     "gnosis": {"gnosis", "xdai"},
-    "celo": {"celo"},
+    "celo": {"celo", "celotoken", "celo-token"},
     "pulsechain": {"pls", "pulsechain"},
     "berachain": {"bera", "berachain"},
-    "abstract": {"abstract"},
+    "abstract": {"abstract", "abstracteth", "abstract-eth"},
+    "robinhood": {"robinhood", "rbh", "rhcc", "robinhoodchain"},
+    "klaytn": {"klaytn", "klay", "kaia", "klaytoken", "klay-token"},
+    "kcc": {"kcc"},
+    "ronin": {"ronin", "ron"},
+    "xdc": {"xdc"},
+    "merlin": {"merlin", "merlinnetwork", "merlin network", "merlbtc"},
+    "oktc": {"oktc", "okc", "oktchain"},
 }
 _NET_TO_CHAIN = {a: c for c, al in _CHAIN_ALIASES.items() for a in al}
 
@@ -107,25 +120,42 @@ def _norm_contract(c: str) -> str:
 
 
 class DexPriceBook:
-    """gid -> {contract_lower: {chain, priceUsd, vol24h, liquidity, contract,
-    dex, url, ts}}."""
+    """gid -> {f'{chain}:{contract_lower}': entry}. The chain prefix matches
+    DexScreenerBook so the scanner's merge of OKX + DS books dedupes correctly
+    (same (chain, contract) key collapses; OKX wins because it's applied
+    second). Without the prefix OKX and DS produced two ghost entries for
+    the same pool with different prices."""
 
     def __init__(self):
         self.book: dict[str, dict[str, dict]] = {}
         self.lock = asyncio.Lock()
 
+    @staticmethod
+    def _key(chain: str, contract: str) -> str:
+        return f"{(chain or '').lower()}:{contract.lower()}"
+
     async def update(self, gid: str, contract: str, entry: dict):
         async with self.lock:
-            self.book.setdefault(gid, {})[contract.lower()] = entry
+            k = self._key(entry.get("chain", ""), contract)
+            self.book.setdefault(gid, {})[k] = entry
 
-    async def remove(self, gid: str, contract: str):
-        """Drop a contract OKX no longer prices, so a stale price can't linger."""
+    async def remove(self, gid: str, contract: str, chain: str | None = None):
+        """Drop the OKX price we can no longer confirm. When chain is given,
+        removes only that (chain, contract) entry — critical for wrong-chain
+        prunes not to wipe the correct-chain twin. When chain is None
+        (legacy), removes every chain-keyed entry for this contract."""
         async with self.lock:
             g = self.book.get(gid)
-            if g is not None:
-                g.pop(contract.lower(), None)
-                if not g:
-                    self.book.pop(gid, None)
+            if g is None:
+                return
+            cl = contract.lower()
+            if chain is not None:
+                g.pop(self._key(chain, contract), None)
+            else:
+                for k in [k for k in g if k.endswith(":" + cl) or k == cl]:
+                    g.pop(k, None)
+            if not g:
+                self.book.pop(gid, None)
 
     async def snapshot(self) -> dict[str, dict[str, dict]]:
         async with self.lock:
@@ -155,10 +185,25 @@ class DexPriceBook:
         except Exception as e:
             log.warning("dex pools load err: %s", e)
             return False
-        self.book = data.get("book", {})
+        raw = data.get("book", {})
+        # migrate: pre-fix keys were bare contracts, now they're "chain:contract"
+        # so OKX and DexScreener books share the same key space and the scanner
+        # merge dedupes them. Re-key any old entries using the entry's chain.
+        self.book = {}
+        migrated = 0
+        for gid, contracts in raw.items():
+            new_d: dict[str, dict] = {}
+            for k, e in contracts.items():
+                if ":" in k:
+                    new_d[k] = e
+                else:
+                    new_d[self._key(e.get("chain", ""), k)] = e
+                    migrated += 1
+            self.book[gid] = new_d
         n = sum(len(v) for v in self.book.values())
-        log.info("dex pools loaded: %d pools across %d groups (age %.1fh)",
-                 n, len(self.book), (time.time() - data.get("ts", 0)) / 3600)
+        log.info("dex pools loaded: %d pools across %d groups (age %.1fh%s)",
+                 n, len(self.book), (time.time() - data.get("ts", 0)) / 3600,
+                 f", migrated {migrated} old keys" if migrated else "")
         return True
 
 
@@ -214,12 +259,23 @@ class DexWatcher:
         self._last_refresh = 0.0
 
     def _refresh_jobs(self) -> None:
+        # dedup by (chain, contract) not by contract alone. Two CEXes reporting
+        # the SAME contract on DIFFERENT chains (usually one of them wrong —
+        # like hitbtc labeling a Base-only VVV as 'ERC-20') would previously
+        # skip the second: only the first-seen chain got polled and, if it was
+        # the wrong one, OKX returned 51001 and pruned the whole thing. Now
+        # each (chain, contract) is a separate job — the wrong chain still
+        # prunes but the right one lives.
         jobs, orig = {}, {}
         skipped = 0
+        cg_added = 0
         for gid, g in self.universe.groups.items():
             ticker = gid.partition("#")[0]
             seen = 0
+            hit_cap = False
             for lst in g.get("listings", []):
+                if hit_cap:
+                    break
                 for net, nd in (lst.get("networks") or {}).items():
                     c = (nd.get("contract") or "").strip()
                     if not c or len(c) <= 6:
@@ -229,20 +285,36 @@ class DexWatcher:
                     if not ci:
                         skipped += 1
                         continue
-                    cl = c.lower()
-                    if cl in jobs:
+                    key = f"{chain}:{c.lower()}"
+                    if key in jobs:
                         continue
-                    jobs[cl] = (gid, chain, ci, ticker)
-                    orig[cl] = c
+                    jobs[key] = (gid, chain, ci, ticker)
+                    orig[key] = c
                     seen += 1
                     if seen >= MAX_CONTRACTS_PER_GROUP:
+                        hit_cap = True
                         break
-                if seen >= MAX_CONTRACTS_PER_GROUP:
-                    break
+            # CG platforms — canonical multichain contracts CEXes usually miss.
+            # Not subject to MAX_CONTRACTS_PER_GROUP so we pick up the full
+            # multichain footprint even for big-family tokens like USDT/USDC.
+            for chain, c in (g.get("cg_platforms") or {}).items():
+                if not c or len(c) <= 6:
+                    continue
+                ci = OKX_CHAIN_INDEX.get(chain)
+                if not ci:
+                    skipped += 1
+                    continue
+                key = f"{chain}:{c.lower()}"
+                if key in jobs:
+                    continue
+                jobs[key] = (gid, chain, ci, ticker)
+                orig[key] = c
+                cg_added += 1
         self._jobs, self._orig = jobs, orig
         self._last_refresh = time.time()
-        log.info("dex: %d contracts to poll across %d groups (%d skipped: chain n/a)",
-                 len(jobs), len({v[0] for v in jobs.values()}), skipped)
+        log.info("dex: %d contracts to poll across %d groups "
+                 "(+%d from CG, %d skipped: chain n/a)",
+                 len(jobs), len({v[0] for v in jobs.values()}), cg_added, skipped)
 
     def _pick_proxy(self):
         return random.choice(self.proxies) if self.proxies else None
@@ -268,9 +340,10 @@ class DexWatcher:
                         break
                 else:
                     # no fresh price; if OKX said "no pool" (not just a network
-                    # blip), prune the stale entry so we never serve it.
+                    # blip), prune ONLY that (chain, contract) entry — we may
+                    # still hold the correct chain's copy for the same address.
                     if saw_no_pool:
-                        await self.book.remove(gid, contract)
+                        await self.book.remove(gid, contract, chain=chain)
             except Exception as ex:
                 log.debug("dex worker err: %s", str(ex)[:60])
             finally:

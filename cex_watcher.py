@@ -58,9 +58,29 @@ EXCHANGE_MAX_SYMBOLS = {
 }
 DEFAULT_MAX_SYMBOLS = 500
 
+# Exchanges where per-symbol watch_ticker multiplex on a single WS works
+# cleanly (empirically verified — see attempt log for the ones that failed).
+#
+# Rejected after live test:
+#   mexc    — Connection closed by remote server (sub cap ~30 hard)
+#   bitmart — "Subscribed total topic quantity exceed" and rate-limit storm
+#   bitrue  — ccxt.pro raises "watchTicker() is not supported yet"
+#   kucoin  — Connection timeout under load
+#   lbank   — Connection timeout storm (1700+ errs/min under load)
+# These fall back to bulk watch_tickers with universe-filtered cap.
+UNIVERSE_MULTIPLEX_EIDS = {
+    "bybit", "phemex", "p2b",
+}
 
-def _build_symbol_list(inst, exch_id: str = "") -> list[str]:
-    cap = EXCHANGE_MAX_SYMBOLS.get(exch_id, DEFAULT_MAX_SYMBOLS)
+
+def _build_symbol_list(inst, exch_id: str = "",
+                        universe_tickers: set[str] | None = None) -> list[str]:
+    """Return list of USD-quoted spot symbols on the instance.
+
+    When universe_tickers is provided, filter to pairs whose BASE is in the
+    universe — this keeps the sub set tight (only tokens we care about) and
+    lets multi-thousand-pair exchanges (mexc/lbank/bitrue) stay within cap
+    while still covering every universe token they list."""
     syms = []
     for sym, m in (inst.markets or {}).items():
         if not m.get("spot"):
@@ -70,11 +90,22 @@ def _build_symbol_list(inst, exch_id: str = "") -> list[str]:
         if m.get("active") is False:
             continue
         q = m.get("quote", "")
-        if q in ("USDT", "USDC", "USD", "BUSD", "DAI", "FDUSD"):
-            syms.append(sym)
+        if q not in ("USDT", "USDC", "USD", "BUSD", "DAI", "FDUSD"):
+            continue
+        if universe_tickers is not None:
+            base = sym.partition("/")[0].upper()
+            if base not in universe_tickers:
+                continue
+        syms.append(sym)
     # Prefer USDT pairs first so the cap keeps the most-liquid markets
     syms.sort(key=lambda s: 0 if s.endswith("/USDT") else 1)
-    return syms[:cap]
+    # Only apply cap to bulk-mode exchanges. Multiplex-mode uses per-symbol
+    # WS which multiplexes on one WS connection — the cap doesn't apply.
+    base_eid = exch_id.partition("#")[0]
+    if base_eid not in UNIVERSE_MULTIPLEX_EIDS:
+        cap = EXCHANGE_MAX_SYMBOLS.get(exch_id, DEFAULT_MAX_SYMBOLS)
+        syms = syms[:cap]
+    return syms
 
 
 async def _watch_per_symbol(exch_id: str, inst: ccxtpro.Exchange, symbols: list[str],
@@ -165,18 +196,31 @@ ORDERBOOK_FALLBACK_MAX_SYMBOLS = 100
 
 
 async def watch_exchange_tickers(exch_id: str, inst: ccxtpro.Exchange,
-                                  book: CexPriceBook, stop_event: asyncio.Event) -> None:
+                                  book: CexPriceBook, stop_event: asyncio.Event,
+                                  universe_tickers: set[str] | None = None) -> None:
     if exch_id.startswith("bingx#"):
         symbols = getattr(inst, "_shard_symbols", [])
+        if universe_tickers is not None:
+            symbols = [s for s in symbols
+                       if s.partition("/")[0].upper() in universe_tickers]
         log.info("[%s] per-symbol WS on %d pairs", exch_id, len(symbols))
         await _watch_per_symbol(exch_id, inst, symbols, book, stop_event)
         return
 
-    symbols = _build_symbol_list(inst, exch_id)
+    symbols = _build_symbol_list(inst, exch_id, universe_tickers)
     if not symbols:
         log.warning("[%s] no spot/USD pairs -- REST polling", exch_id)
         await rest_poll(exch_id, inst, book, stop_event)
         return
+
+    base_eid = exch_id.partition("#")[0]
+    # Multiplex mode: per-symbol WS on one connection. Bypasses bulk caps.
+    if base_eid in UNIVERSE_MULTIPLEX_EIDS:
+        log.info("[%s] universe multiplex: %d pairs on per-symbol WS",
+                 exch_id, len(symbols))
+        await _watch_per_symbol(exch_id, inst, symbols, book, stop_event)
+        return
+
     log.info("[%s] WS subscribe to %d pairs", exch_id, len(symbols))
 
     has_bulk = inst.has.get("watchTickers")

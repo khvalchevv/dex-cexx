@@ -19,3 +19,15 @@ alerts_debug.json
 *.log
 *.err
 smoke.out
+
+# Runtime caches (added)
+cg_coins.json
+cmc_coins.json
+ds_pools.json
+
+# One-off scratch scripts / dumps
+_*.py
+all_pools.json
+combined_coverage.json
+dex_screener_coverage.json
+kyber_overlap.json

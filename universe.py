@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 UNIVERSE_FILE = os.path.join(_HERE, "token_universe.json")
-REBUILD_INTERVAL_SEC = int(os.getenv("UNIVERSE_REBUILD_SEC", str(24 * 3600)))
+REBUILD_INTERVAL_SEC = int(os.getenv("UNIVERSE_REBUILD_SEC", str(3600)))  # 1h
 UNIVERSE_MAX_AGE_SEC = int(os.getenv("UNIVERSE_MAX_AGE_SEC", str(48 * 3600)))
 
 # Ticker prefixes that indicate a wrapper/staking variant — used for the
@@ -101,13 +101,20 @@ def _is_wrap_pair(t1: set, t2: set) -> bool:
     return False
 
 
-def _build_groups(listings: list[dict]) -> list[list[int]]:
+def _build_groups(listings: list[dict],
+                    cg_ctr_index: dict[tuple[str, str], str] | None = None
+                    ) -> list[list[int]]:
     """Contract-identity grouping with a same-chain contract-conflict guard.
 
-      Pass A — CONTRACT: listings sharing a contract address are the same
+      Pass A  — CONTRACT: listings sharing a contract address are the same
         token (handles multichain: each exchange's listing carries all its
         networks, so they share at least one contract).
-      Pass B — TICKER (guarded) and Pass C — NAME_KEY (guarded): merge by
+      Pass A' — CG_CROSS_CHAIN (new): CoinGecko authoritative multichain
+        mapping. If two listings' contracts appear in the same CG coin's
+        platforms dict (e.g. WETH on ethereum vs base, USDC on 15 chains),
+        they belong to the same project and get merged — even when the
+        contract strings themselves differ across chains.
+      Pass B  — TICKER (guarded) and Pass C — NAME_KEY (guarded): merge by
         ticker / project-name, BUT never merge two components that hold
         DIFFERENT contracts on the SAME chain — those are different projects
         sharing a ticker (the two BSC "DUCKY"s; Gensyn vs SleepAI). They stay
@@ -203,6 +210,32 @@ def _build_groups(listings: list[dict]) -> list[list[int]]:
             dst.setdefault(ch, set()).update(cs)
         root_all.setdefault(nr, set()).update(root_all.get(old, set()))
 
+    # Pass A': CG cross-chain identity — union listings sharing a CG coin id.
+    if cg_ctr_index:
+        by_cg: dict[str, int] = {}
+        cg_merges = 0
+        for i, lst in enumerate(listings):
+            hit_id: str | None = None
+            for ch, c in _listing_cc(lst):
+                key = (ch, c.lower())
+                cg_id = cg_ctr_index.get(key)
+                if cg_id:
+                    hit_id = cg_id
+                    break
+            if not hit_id:
+                continue
+            if hit_id in by_cg:
+                # _gunion respects conflict + forbidden-pair guards
+                prev = by_cg[hit_id]
+                if uf.find(prev) != uf.find(i):
+                    _gunion(prev, i)
+                    cg_merges += 1
+            else:
+                by_cg[hit_id] = i
+        if cg_merges:
+            log.info("universe: Pass A' CG cross-chain merged %d listing pairs "
+                     "(%d unique cg_ids)", cg_merges, len(by_cg))
+
     # Pass B: ticker (guarded).
     by_ticker: dict[str, int] = {}
     for i, lst in enumerate(listings):
@@ -235,9 +268,41 @@ class TokenUniverse:
         self.index: dict[tuple[str, str], str] = {}
         self.built_ts: float = 0.0
 
+    def all_tickers(self) -> set[str]:
+        """Set of every base symbol across all listings — used by
+        cex_watcher to filter exchange markets to only universe tokens."""
+        out: set[str] = set()
+        for g in self.groups.values():
+            for lst in g.get("listings", []):
+                s = (lst.get("symbol") or "").upper()
+                if s:
+                    out.add(s)
+        return out
+
     # ---------- build ----------
 
-    def build_from_cache(self, currency_cache, ticker_names: dict) -> None:
+    def build_from_cache(self, currency_cache, ticker_names: dict) -> set[str]:
+        """Rebuild groups from currency_cache.
+
+        Returns the set of NEW group ids (present after rebuild, absent before).
+        Empty set on first build or when nothing changed. Used by the alerter to
+        push TG notifications about freshly-listed tokens.
+
+        Safety: if the current cache covers FEWER exchanges than the existing
+        universe was built from, we KEEP the existing universe rather than
+        nuke it. Prevents transient fetch_currencies failures (proxy timeout,
+        expired API key) from wiping out otherwise-valid group data."""
+        previous_gids = set(self.groups.keys())
+        cache_eids = {_norm(e) for e in currency_cache.cache
+                      if currency_cache.cache.get(e)}
+        prev_eids = {lst["eid"] for g in self.groups.values()
+                     for lst in g.get("listings", [])}
+        if prev_eids and len(cache_eids) < len(prev_eids):
+            log.warning("universe: cache has %d exchanges vs universe's %d "
+                        "— preserving existing universe (missing: %s)",
+                        len(cache_eids), len(prev_eids),
+                        ",".join(sorted(prev_eids - cache_eids)))
+            return set()
         listings: list[dict] = []
         for eid, assets in currency_cache.cache.items():
             eid = _norm(eid)
@@ -251,9 +316,39 @@ class TokenUniverse:
                 })
         if not listings:
             log.warning("universe: no listings in currency cache")
-            return
+            return set()
 
-        comps = _build_groups(listings)
+        # Build (chain, contract) -> canonical_id index for cross-chain merging.
+        # Union CoinGecko + CoinMarketCap. If both know the same coin, CG wins
+        # (its data is denser and machine-readable). Any exchange listing whose
+        # contract is in this index gets merged with all other listings sharing
+        # the same canonical_id — same project across different chains.
+        cg_ctr_index: dict[tuple[str, str], str] = {}
+        try:
+            import coingecko
+            coins, _ts = coingecko.load()
+            if coins:
+                cg_ctr_index = coingecko.build_contract_index(coins)
+                log.info("universe: CG contract index loaded (%d entries)",
+                         len(cg_ctr_index))
+        except Exception as e:
+            log.warning("universe: CG contract index load err: %s", e)
+        try:
+            import coinmarketcap
+            cmc_coins, _ts = coinmarketcap.load()
+            if cmc_coins:
+                cmc_ctr = coinmarketcap.build_contract_index(cmc_coins)
+                added = 0
+                for k, cmc_id in cmc_ctr.items():
+                    if k not in cg_ctr_index:
+                        cg_ctr_index[k] = f"cmc:{cmc_id}"
+                        added += 1
+                log.info("universe: CMC contract index +%d entries (total %d)",
+                         added, len(cg_ctr_index))
+        except Exception as e:
+            log.warning("universe: CMC contract index load err: %s", e)
+
+        comps = _build_groups(listings, cg_ctr_index=cg_ctr_index or None)
         groups: dict[str, dict] = {}
         index: dict[tuple[str, str], str] = {}
         for comp in comps:
@@ -268,9 +363,28 @@ class TokenUniverse:
             # can't pair it with anything.
             if len(eids) < 2 and not has_contract:
                 continue
-            # group id = most common ticker in the merged component
+            # gid stays ticker-based — cex_book & existing lookups depend on it.
+            # cg_id lives on the group (set by _augment_from_coingecko later).
             tickers = [m["symbol"].upper() for m in members]
             gid = max(set(tickers), key=tickers.count)
+            # Precompute the group's cg_id from any contract that matches CG
+            # — used by Pass A' cross-chain merging (already done) and shown
+            # on the group so /augment doesn't have to rediscover it.
+            cg_hit: str | None = None
+            if cg_ctr_index:
+                from dex_watcher import _norm_net as _nn
+                for m in members:
+                    for ch, nd in (m.get("networks") or {}).items():
+                        c = (nd.get("contract") or "").strip().lower()
+                        if not c:
+                            continue
+                        ch_n = _nn(ch) or ch.lower()
+                        h = cg_ctr_index.get((ch_n, c))
+                        if h:
+                            cg_hit = h
+                            break
+                    if cg_hit:
+                        break
             # de-dupe key collisions across truly different components
             gkey = gid
             suffix = 0
@@ -290,13 +404,88 @@ class TokenUniverse:
                     "networks": m["networks"],
                 })
                 index[(m["eid"], m["symbol"].upper())] = gkey
-            groups[gkey] = {"display": display, "listings": lst_out}
+            group_entry = {"display": display, "listings": lst_out}
+            if cg_hit:
+                group_entry["cg_id"] = cg_hit
+            groups[gkey] = group_entry
         self.groups = groups
         self.index = index
         self.built_ts = time.time()
         log.info("universe built: %d groups from %d listings (%d exchanges)",
                  len(groups), len(listings),
                  len({l['eid'] for l in listings}))
+        # Augment with CoinGecko: for each group, look up its ticker in the CG
+        # bulk index and merge canonical multichain platforms as
+        # group["cg_platforms"] = {chain: contract}. DexWatcher picks these up
+        # in _refresh_jobs. Adds coverage the CEXes don't report (e.g. USDC on
+        # 15 chains vs the 3-4 CEXes bother listing).
+        try:
+            self._augment_from_coingecko()
+        except Exception as e:
+            log.warning("universe: CG augment failed: %s", e)
+        new_gids = set(self.groups.keys()) - previous_gids
+        if previous_gids and new_gids:
+            log.info("universe: %d NEW groups: %s",
+                     len(new_gids), ",".join(sorted(new_gids)[:20]))
+        return new_gids
+
+    def _augment_from_coingecko(self) -> None:
+        import coingecko
+        from dex_watcher import _norm_contract
+        coins, ts = coingecko.load()
+        if not coins:
+            log.info("universe: no CG index yet, skipping augment")
+            return
+        idx = coingecko.build_index(coins)
+        matched = 0
+        added_pairs = 0
+        for gid, g in self.groups.items():
+            base = gid.partition("#")[0]
+            candidates = idx.get(base) or []
+            if not candidates:
+                continue
+            # collect our existing (chain, contract-lower) so we can
+            # (a) disambiguate colliding tickers by contract match
+            # (b) not double-add chains we already have
+            existing_pairs: set[tuple[str, str]] = set()
+            existing_contracts: set[str] = set()
+            for lst in g["listings"]:
+                for net, nd in (lst.get("networks") or {}).items():
+                    c = _norm_contract(nd.get("contract") or "")
+                    if c and len(c) > 6:
+                        cl = c.lower()
+                        existing_contracts.add(cl)
+                        chain = _norm_net(net) or net.lower()
+                        existing_pairs.add((chain, cl))
+
+            # disambiguate: prefer the CG entry that has any overlapping contract.
+            picked: dict | None = None
+            for cand in candidates:
+                if any(a.lower() in existing_contracts
+                       for a in cand["platforms"].values()):
+                    picked = cand
+                    break
+            if picked is None:
+                if len(candidates) == 1:
+                    picked = candidates[0]
+                else:
+                    continue                                        # ambiguous, skip
+
+            # merge platforms that aren't already covered
+            cg_plats: dict[str, str] = {}
+            for chain, addr in picked["platforms"].items():
+                addr_l = addr.lower()
+                if (chain, addr_l) in existing_pairs:
+                    continue
+                cg_plats[chain] = addr_l
+                added_pairs += 1
+            if cg_plats:
+                g["cg_platforms"] = cg_plats
+                g["cg_id"] = picked["id"]
+                g["cg_name"] = picked["name"]
+                matched += 1
+        log.info("CG augment: %d groups matched, +%d (chain,contract) pairs",
+                 matched, added_pairs)
 
     # ---------- persistence ----------
 
@@ -334,7 +523,11 @@ class TokenUniverse:
     # ---------- rebuild loop ----------
 
     async def rebuild_loop(self, currency_cache, ticker_names_provider,
-                            stop_event: asyncio.Event) -> None:
+                            stop_event: asyncio.Event,
+                            on_new_groups=None) -> None:
+        """Periodic rebuild. If on_new_groups is provided, it's called with
+        (new_gids: set[str], groups_snapshot: dict) after each rebuild that
+        produced fresh entries — used by the alerter to push TG notifications."""
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(),
@@ -343,7 +536,15 @@ class TokenUniverse:
             except asyncio.TimeoutError:
                 pass
             try:
-                self.build_from_cache(currency_cache, ticker_names_provider())
+                new_gids = self.build_from_cache(currency_cache,
+                                                    ticker_names_provider())
                 self.save()
+                if new_gids and on_new_groups is not None:
+                    try:
+                        snap = {gid: self.groups[gid] for gid in new_gids
+                                if gid in self.groups}
+                        await on_new_groups(new_gids, snap)
+                    except Exception as e:
+                        log.warning("on_new_groups callback err: %s", e)
             except Exception as e:
                 log.exception("universe rebuild err: %s", e)

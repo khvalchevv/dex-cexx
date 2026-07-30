@@ -25,6 +25,35 @@ RATE_LIMIT_MAX_RETRIES = 5
 RATE_LIMIT_BACKOFF_SEC = 2
 
 
+async def _http_get_json(session, url, proxies, headers=None, direct_first=True):
+    """GET a JSON endpoint with 'direct first, proxy fallback' strategy.
+
+    Direct connect is faster and more reliable than random-proxy roulette when
+    the endpoint isn't geo-blocked. Only fall back to a rotating proxy if the
+    direct call fails."""
+    hdr = headers or {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    tries = [None]                            # direct
+    tries += [random.choice(proxies) if proxies else None
+              for _ in range(RATE_LIMIT_MAX_RETRIES - 1)]
+    if not direct_first:
+        tries = tries[1:] + [None]            # proxy first, then direct
+    last_err = ""
+    for i, proxy in enumerate(tries):
+        try:
+            async with session.get(url, headers=hdr, proxy=proxy,
+                                    timeout=REST_TIMEOUT) as r:
+                if r.status != 200:
+                    last_err = f"HTTP {r.status}"
+                    continue
+                return await r.json(content_type=None)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:80]}"
+            await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC if i > 0 else 0)
+    log.warning("http_get_json %s exhausted %d tries: %s",
+                url[:80], len(tries), last_err[:120])
+    return None
+
+
 def _norm(exch_id: str) -> str:
     """Strip shard suffix (bingx#0 -> bingx)."""
     return exch_id.partition("#")[0]
@@ -271,54 +300,54 @@ def _is_rate_limited(err_str: str) -> bool:
 
 
 async def _bingx_fetch_currencies_direct(inst, proxies: list[str]) -> dict | None:
-    """Direct REST call to bingx /openApi/wallets/v1/capital/config/getall with
-    per-request proxy rotation. ccxt's default path keeps hitting per-IP rate
-    limits even though the endpoint is authenticated; rotating across our 1k
-    proxy pool gives us fresh source IPs and side-steps the throttle.
+    """Direct REST call to bingx /openApi/wallets/v1/capital/config/getall.
 
-    Returns the raw ccxt-shaped {code: {networks: {NET: ...}}} dict, or None.
+    Strategy: direct connection first (measured ~700ms, always returns full
+    data). Rotating proxies as a last-resort fallback in case bingx ever
+    starts rate-limiting our residential IP.
     """
     if not inst.apiKey or not inst.secret:
         return None
 
+    def _sign_url():
+        ts = str(int(time.time() * 1000))
+        qs = f"timestamp={ts}"
+        sig = hmac.new(inst.secret.encode(), qs.encode(),
+                         hashlib.sha256).hexdigest()
+        return (f"https://open-api.bingx.com/openApi/wallets/v1/"
+                f"capital/config/getall?{qs}&signature={sig}")
+
+    headers = {"X-BX-APIKEY": inst.apiKey}
+    tries = [None]                            # direct first
+    tries += [random.choice(proxies) if proxies else None
+              for _ in range(RATE_LIMIT_MAX_RETRIES - 1)]
     async with aiohttp.ClientSession() as session:
         last_err = ""
-        for attempt in range(RATE_LIMIT_MAX_RETRIES):
-            proxy = random.choice(proxies) if proxies else None
-            ts = str(int(time.time() * 1000))
-            qs = f"timestamp={ts}"
-            sig = hmac.new(inst.secret.encode(), qs.encode(),
-                             hashlib.sha256).hexdigest()
-            url = (f"https://open-api.bingx.com/openApi/wallets/v1/"
-                   f"capital/config/getall?{qs}&signature={sig}")
+        for i, proxy in enumerate(tries):
+            url = _sign_url()                 # fresh signed URL per attempt
             try:
-                async with session.get(url, proxy=proxy,
-                                       headers={"X-BX-APIKEY": inst.apiKey},
+                async with session.get(url, proxy=proxy, headers=headers,
                                        timeout=REST_TIMEOUT) as r:
                     data = await r.json(content_type=None)
             except Exception as e:
-                last_err = str(e)
-                await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
+                last_err = f"{type(e).__name__}: {str(e)[:80]}"
+                if i < len(tries) - 1:
+                    await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
                 continue
-
-            code = data.get("code")
+            code = data.get("code") if isinstance(data, dict) else None
             if code != 0:
-                # bingx error envelope: {code: int, msg: str, data: null}
-                msg = data.get("msg", "") or str(data)
+                msg = (data.get("msg") if isinstance(data, dict) else "") or str(data)[:80]
                 last_err = f"code={code} msg={msg[:80]}"
                 if _is_rate_limited(last_err) or code in (100410, 100400, 429):
-                    log.debug("bingx rate-limited (try %d) — rotating proxy",
-                                attempt + 1)
                     await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
                     continue
                 log.warning("bingx fetch_currencies API err: %s", last_err)
                 return None
             items = data.get("data") or []
             return _bingx_parse(items)
-
-        log.warning("bingx fetch_currencies exhausted %d retries: %s",
-                    RATE_LIMIT_MAX_RETRIES, last_err[:120])
-        return None
+    log.warning("bingx fetch_currencies exhausted %d tries: %s",
+                len(tries), last_err[:120])
+    return None
 
 
 def _bingx_parse(items: list[dict]) -> dict:
@@ -357,35 +386,15 @@ def _bingx_parse(items: list[dict]) -> dict:
 
 
 async def _lbank_fetch_currencies_direct(inst, proxies: list[str]) -> dict | None:
-    """lbank /v2/withdrawConfigs.do — public endpoint, one batch with chain +
-    canWithDraw + fee for all currencies. No deposit flag, no contract address.
-    We still expose the withdraw flag + per-network listing which the alerter
-    can show.
-    """
-    url = "https://api.lbkex.com/v2/withdrawConfigs.do"
+    """lbank /v2/withdrawConfigs.do — public per-chain flags + fees.
+    No contract addresses (lbank doesn't publish those)."""
     async with aiohttp.ClientSession() as session:
-        last_err = ""
-        for attempt in range(RATE_LIMIT_MAX_RETRIES):
-            proxy = random.choice(proxies) if proxies else None
-            try:
-                async with session.get(url, proxy=proxy,
-                                       timeout=REST_TIMEOUT) as r:
-                    data = await r.json(content_type=None)
-            except Exception as e:
-                last_err = str(e)
-                await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
-                continue
-            items = data.get("data") if isinstance(data, dict) else None
-            if not isinstance(items, list):
-                last_err = f"unexpected payload: {str(data)[:120]}"
-                if _is_rate_limited(last_err):
-                    await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
-                    continue
-                log.warning("lbank withdrawConfigs err: %s", last_err)
-                return None
-            return _lbank_parse(items)
-        log.warning("lbank withdrawConfigs exhausted retries: %s", last_err[:120])
+        data = await _http_get_json(
+            session, "https://api.lbkex.com/v2/withdrawConfigs.do", proxies)
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
         return None
+    return _lbank_parse(items)
 
 
 def _lbank_parse(items: list[dict]) -> dict:
@@ -418,102 +427,264 @@ def _lbank_parse(items: list[dict]) -> dict:
 async def _bitmart_fetch_currencies_direct(inst, proxies: list[str]) -> dict | None:
     """bitmart public /account/v1/currencies — flat list of
     {currency, network, contract_address, deposit_enabled, withdraw_enabled,
-    withdraw_fee}. ccxt's bitmart only surfaces a top-level deposit/withdraw
-    bool with no contract; this endpoint has the full per-network breakdown.
-    Public, so proxy rotation works.
-    """
-    url = "https://api-cloud.bitmart.com/account/v1/currencies"
+    withdraw_fee}."""
     async with aiohttp.ClientSession() as session:
-        last_err = ""
-        for attempt in range(RATE_LIMIT_MAX_RETRIES):
-            proxy = random.choice(proxies) if proxies else None
-            try:
-                async with session.get(url, proxy=proxy, timeout=REST_TIMEOUT) as r:
-                    data = await r.json(content_type=None)
-            except Exception as e:
-                last_err = str(e)
-                await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
-                continue
-            items = ((data or {}).get("data") or {}).get("currencies")
-            if not isinstance(items, list):
-                last_err = f"unexpected payload: {str(data)[:120]}"
-                if _is_rate_limited(last_err):
-                    await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
-                    continue
-                log.warning("bitmart currencies err: %s", last_err)
-                return None
-            out: dict[str, dict] = {}
-            for it in items:
-                cur = (it.get("currency") or "")
-                # bitmart uses "TOKEN" or "TOKEN-NETWORK"
-                code = cur.split("-")[0].upper()
-                if not code:
-                    continue
-                net = (it.get("network") or cur).upper()
-                entry = out.setdefault(code, {"networks": {}, "info": {}})
-                entry["networks"][net] = {
-                    "id": net, "network": net,
-                    "deposit": bool(it.get("deposit_enabled")),
-                    "withdraw": bool(it.get("withdraw_enabled")),
-                    "fee": float(it["withdraw_fee"]) if it.get("withdraw_fee") else None,
-                    "info": {"contractAddress": it.get("contract_address") or ""},
-                }
-            return out
-        log.warning("bitmart currencies exhausted retries: %s", last_err[:120])
+        data = await _http_get_json(
+            session, "https://api-cloud.bitmart.com/account/v1/currencies",
+            proxies)
+    items = ((data or {}).get("data") or {}).get("currencies")
+    if not isinstance(items, list):
         return None
+    out: dict[str, dict] = {}
+    for it in items:
+        cur = (it.get("currency") or "")
+        code = cur.split("-")[0].upper()
+        if not code:
+            continue
+        net = (it.get("network") or cur).upper()
+        entry = out.setdefault(code, {"networks": {}, "info": {"name": it.get("name")}})
+        entry["networks"][net] = {
+            "id": net, "network": net,
+            "deposit": bool(it.get("deposit_enabled")),
+            "withdraw": bool(it.get("withdraw_enabled")),
+            "fee": float(it["withdraw_fee"]) if it.get("withdraw_fee") else None,
+            "info": {"contractAddress": it.get("contract_address") or ""},
+        }
+    return out
 
 
 async def _coinbase_fetch_currencies_direct(inst, proxies: list[str]) -> dict | None:
-    """Coinbase Exchange public /currencies — list of
-    {id, status, supported_networks:[{name/id, status, contract_address,
-    min_withdrawal_amount, network_confirmations}]}. ccxt's coinbaseadvanced
-    needs auth and still omits contracts; this public endpoint has them.
-    """
-    url = "https://api.exchange.coinbase.com/currencies"
+    """Coinbase Exchange public /currencies — has per-network contract
+    addresses in `supported_networks[].contract_address`."""
     async with aiohttp.ClientSession() as session:
-        last_err = ""
-        for attempt in range(RATE_LIMIT_MAX_RETRIES):
-            proxy = random.choice(proxies) if proxies else None
-            try:
-                async with session.get(url, proxy=proxy,
-                                       headers={"User-Agent": "Mozilla/5.0"},
-                                       timeout=REST_TIMEOUT) as r:
-                    data = await r.json(content_type=None)
-            except Exception as e:
-                last_err = str(e)
-                await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
-                continue
-            if not isinstance(data, list):
-                last_err = f"unexpected payload: {str(data)[:120]}"
-                if _is_rate_limited(last_err):
-                    await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
-                    continue
-                log.warning("coinbase currencies err: %s", last_err)
-                return None
-            out: dict[str, dict] = {}
-            for it in data:
-                sym = (it.get("id") or "").upper()
-                if not sym:
-                    continue
-                overall_online = (it.get("status") or "").lower() == "online"
-                nets: dict[str, dict] = {}
-                for n in (it.get("supported_networks") or []):
-                    nm = (n.get("name") or n.get("id") or "").upper()
-                    if not nm:
-                        continue
-                    online = (n.get("status") or "").lower() == "online"
-                    nets[nm] = {
-                        "id": nm, "network": nm,
-                        "deposit": online and overall_online,
-                        "withdraw": online and overall_online,
-                        "fee": None,
-                        "info": {"contractAddress": n.get("contract_address") or ""},
-                    }
-                if nets:
-                    out[sym] = {"networks": nets, "info": it}
-            return out
-        log.warning("coinbase currencies exhausted retries: %s", last_err[:120])
+        data = await _http_get_json(
+            session, "https://api.exchange.coinbase.com/currencies", proxies)
+    if not isinstance(data, list):
         return None
+    out: dict[str, dict] = {}
+    for it in data:
+        sym = (it.get("id") or "").upper()
+        if not sym:
+            continue
+        overall_online = (it.get("status") or "").lower() == "online"
+        nets: dict[str, dict] = {}
+        for n in (it.get("supported_networks") or []):
+            nm = (n.get("name") or n.get("id") or "").upper()
+            if not nm:
+                continue
+            online = (n.get("status") or "").lower() == "online"
+            nets[nm] = {
+                "id": nm, "network": nm,
+                "deposit": online and overall_online,
+                "withdraw": online and overall_online,
+                "fee": None,
+                "info": {"contractAddress": n.get("contract_address") or ""},
+            }
+        # Fallback: no supported_networks but details.crypto_address_link has
+        # a token URL with the contract embedded (single-chain assets).
+        if not nets:
+            link = (it.get("details") or {}).get("crypto_address_link", "")
+            c = _addr_from_url(link)
+            if c:
+                nets["ETH"] = {  # default chain for unlabeled ETH tokens
+                    "id": "ETH", "network": "ETH",
+                    "deposit": overall_online, "withdraw": overall_online,
+                    "fee": None,
+                    "info": {"contractAddress": c},
+                }
+        if nets:
+            out[sym] = {"networks": nets, "info": it}
+    return out
+
+
+async def _bitrue_fetch_currencies_direct(inst, proxies):
+    """bitrue /api/v1/exchangeInfo — has `coins` array with per-chain flags.
+    No contract addresses in the public payload."""
+    async with aiohttp.ClientSession() as session:
+        data = await _http_get_json(
+            session, "https://openapi.bitrue.com/api/v1/exchangeInfo", proxies)
+    coins = (data or {}).get("coins")
+    if not isinstance(coins, list):
+        return None
+    out = {}
+    for c in coins:
+        code = (c.get("coin") or "").upper()
+        if not code: continue
+        nets = {}
+        for cd in c.get("chainDetail") or []:
+            ch = (cd.get("chain") or "").upper()
+            if not ch: continue
+            nets[ch] = {
+                "id": ch, "network": ch,
+                "deposit": bool(cd.get("enableDeposit")),
+                "withdraw": bool(cd.get("enableWithdraw")),
+                "fee": float(cd["withdrawFee"]) if cd.get("withdrawFee") not in (None,"") else None,
+                "info": {"contractAddress": ""},
+            }
+        if nets:
+            out[code] = {"networks": nets, "info": {"name": c.get("coinFulName")}}
+    return out
+
+
+async def _hashkey_fetch_currencies_direct(inst, proxies):
+    """hashkey /api/v1/exchangeInfo — coins[] with chainTypes[].
+    No contracts published."""
+    async with aiohttp.ClientSession() as session:
+        data = await _http_get_json(
+            session, "https://api-glb.hashkey.com/api/v1/exchangeInfo", proxies)
+    coins = (data or {}).get("coins")
+    if not isinstance(coins, list):
+        return None
+    out = {}
+    for c in coins:
+        code = (c.get("coinId") or "").upper()
+        if not code: continue
+        overall_dep = bool(c.get("allowDeposit"))
+        overall_wd = bool(c.get("allowWithdraw"))
+        nets = {}
+        for ct in c.get("chainTypes") or []:
+            ch = (ct.get("chainType") or "").upper()
+            if not ch: continue
+            nets[ch] = {
+                "id": ch, "network": ch,
+                "deposit": bool(ct.get("allowDeposit", overall_dep)),
+                "withdraw": bool(ct.get("allowWithdraw", overall_wd)),
+                "fee": float(ct["withdrawFee"]) if ct.get("withdrawFee") not in (None,"") else None,
+                "info": {"contractAddress": ""},
+            }
+        if nets:
+            out[code] = {"networks": nets, "info": {"name": c.get("coinFullName") or c.get("coinName")}}
+    return out
+
+
+async def _phemex_fetch_currencies_direct(inst, proxies):
+    """phemex /public/products — has currencies list. No per-chain data or
+    contracts, so we emit a single PHEMEX bucket per currency."""
+    async with aiohttp.ClientSession() as session:
+        data = await _http_get_json(
+            session, "https://api.phemex.com/public/products", proxies)
+    curs = ((data or {}).get("data") or {}).get("currencies")
+    if not isinstance(curs, list):
+        return None
+    out = {}
+    for c in curs:
+        code = (c.get("currency") or "").upper()
+        if not code: continue
+        listed = (c.get("status") or "").lower() == "listed"
+        out[code] = {
+            "networks": {"PHEMEX": {
+                "deposit": listed, "withdraw": listed,
+                "fee": None, "info": {"contractAddress": ""},
+            }},
+            "info": {"name": c.get("name")},
+        }
+    return out
+
+
+async def _bitstamp_fetch_currencies_direct(inst, proxies):
+    """bitstamp /api/v2/currencies/ — has per-network flags but NO contracts."""
+    async with aiohttp.ClientSession() as session:
+        data = await _http_get_json(
+            session, "https://www.bitstamp.net/api/v2/currencies/", proxies)
+    if not isinstance(data, list):
+        return None
+    out = {}
+    for it in data:
+        code = (it.get("currency") or "").upper()
+        if not code: continue
+        overall_dep = (it.get("deposit") or "").lower() == "enabled"
+        overall_wd = (it.get("withdrawal") or "").lower() == "enabled"
+        nets = {}
+        for n in it.get("networks") or []:
+            ch = (n.get("network") or "").upper()
+            if not ch: continue
+            nets[ch] = {
+                "id": ch, "network": ch,
+                "deposit": (n.get("deposit") or "").lower() == "enabled" and overall_dep,
+                "withdraw": (n.get("withdrawal") or "").lower() == "enabled" and overall_wd,
+                "fee": None, "info": {"contractAddress": ""},
+            }
+        # Fallback to a single bucket when no networks published (native coins)
+        if not nets and (overall_dep or overall_wd):
+            nets["BITSTAMP"] = {"deposit": overall_dep, "withdraw": overall_wd,
+                                 "fee": None, "info": {"contractAddress": ""}}
+        if nets:
+            out[code] = {"networks": nets, "info": {"name": it.get("name")}}
+    return out
+
+
+async def _okx_fetch_currencies_direct(inst, proxies):
+    """okx /api/v5/asset/currencies — private, needs API key. Returns per-chain
+    ccy/chain/contract mapping. ccxt.okx().load_markets() crashes on a
+    parse_market NoneType bug, so we can't rely on ccxt for this exchange."""
+    if not (inst.apiKey and inst.secret and getattr(inst, "password", None)):
+        return None
+    import base64, hmac as _hmac, hashlib as _hashlib, datetime as _dt
+    ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.") + \
+         f"{_dt.datetime.utcnow().microsecond // 1000:03d}Z"
+    path = "/api/v5/asset/currencies"
+    prehash = ts + "GET" + path
+    sig = base64.b64encode(_hmac.new(inst.secret.encode(), prehash.encode(),
+                                       _hashlib.sha256).digest()).decode()
+    headers = {
+        "OK-ACCESS-KEY": inst.apiKey,
+        "OK-ACCESS-SIGN": sig,
+        "OK-ACCESS-TIMESTAMP": ts,
+        "OK-ACCESS-PASSPHRASE": inst.password,
+        "User-Agent": "Mozilla/5.0",
+    }
+    async with aiohttp.ClientSession() as session:
+        data = await _http_get_json(
+            session, "https://www.okx.com" + path, proxies, headers=headers)
+    items = (data or {}).get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        log.warning("okx currencies: unexpected payload: %s", str(data)[:120])
+        return None
+    out: dict[str, dict] = {}
+    for it in items:
+        code = (it.get("ccy") or "").upper()
+        if not code: continue
+        chain_full = it.get("chain") or ""      # e.g. "USDT-Ethereum"
+        # chain field is "<ccy>-<network>", strip ccy prefix
+        ch = chain_full.split("-", 1)[1] if "-" in chain_full else chain_full
+        ch = ch.upper() or "OKX"
+        entry = out.setdefault(code, {"networks": {}, "info": {"name": it.get("name")}})
+        entry["networks"][ch] = {
+            "id": ch, "network": ch,
+            "deposit": bool(it.get("canDep")),
+            "withdraw": bool(it.get("canWd")),
+            "fee": float(it["minFee"]) if it.get("minFee") not in (None,"") else None,
+            "info": {"contractAddress": it.get("ctAddr") or ""},
+        }
+    return out
+
+
+async def _cryptocom_fetch_currencies_direct(inst, proxies):
+    """cryptocom /exchange/v1/public/get-currencies — publishes tradable
+    currencies but no networks/contracts. We emit a single CRYPTOCOM bucket
+    per currency."""
+    async with aiohttp.ClientSession() as session:
+        data = await _http_get_json(
+            session, "https://api.crypto.com/exchange/v1/public/get-currencies",
+            proxies)
+    items = ((data or {}).get("result") or {}).get("data")
+    if not isinstance(items, list):
+        return None
+    out = {}
+    seen = set()
+    for it in items:
+        code = (it.get("base_ccy") or "").upper()
+        if not code or code in seen: continue
+        seen.add(code)
+        active = bool(it.get("tradable"))
+        out[code] = {
+            "networks": {"CRYPTOCOM": {
+                "deposit": active, "withdraw": active,
+                "fee": None, "info": {"contractAddress": ""},
+            }},
+            "info": {"name": it.get("display_name")},
+        }
+    return out
 
 
 # Per-exchange override: returns raw ccxt-shaped currencies dict, or None.
@@ -522,6 +693,12 @@ _DIRECT_FETCHERS = {
     "lbank": _lbank_fetch_currencies_direct,
     "bitmart": _bitmart_fetch_currencies_direct,
     "coinbaseadvanced": _coinbase_fetch_currencies_direct,
+    "bitrue": _bitrue_fetch_currencies_direct,
+    "hashkey": _hashkey_fetch_currencies_direct,
+    "phemex": _phemex_fetch_currencies_direct,
+    "bitstamp": _bitstamp_fetch_currencies_direct,
+    "cryptocom": _cryptocom_fetch_currencies_direct,
+    "okx": _okx_fetch_currencies_direct,
 }
 
 
@@ -574,15 +751,19 @@ class CurrencyCache:
                 inst.options["fetchCurrencies"] = prev
 
     async def refresh_one(self, exch_id: str, inst) -> None:
-        if not inst.has.get("fetchCurrencies"):
-            return
         norm_id = _norm(exch_id)
-        currs = None
-        # Direct REST path for exchanges with known rate-limit problems.
         direct = _DIRECT_FETCHERS.get(norm_id)
+        # If ccxt claims no fetchCurrencies AND we have no direct fetcher, quit.
+        if not inst.has.get("fetchCurrencies") and direct is None:
+            log.debug("[%s] has.fetchCurrencies=False and no direct — skipping",
+                       exch_id)
+            return
+        currs = None
+        # Direct REST path for exchanges with known rate-limit problems OR
+        # for those ccxt refuses to fetch currencies for (cryptocom).
         if direct is not None:
             currs = await direct(inst, self.proxies)
-        if currs is None:
+        if currs is None and inst.has.get("fetchCurrencies"):
             # Fallback to ccxt's built-in fetch_currencies (also tolerates rate
             # limits with retries + proxy rotation).
             try:
@@ -591,6 +772,8 @@ class CurrencyCache:
                 log.warning("[%s] fetch_currencies err: %s", exch_id, str(e)[:120])
                 return
         if not currs:
+            log.warning("[%s] fetch_currencies returned empty (0 currencies)",
+                        exch_id)
             return
         norm_id = _norm(exch_id)
         result: dict[str, dict] = {}
@@ -617,8 +800,13 @@ class CurrencyCache:
         async with self.lock:
             self.cache[norm_id] = result
             self.names[norm_id] = names
-        log.info("[%s] currencies refreshed: %d assets (%d named)",
-                 norm_id, len(result), len(names))
+        with_contract = sum(
+            1 for _, r in result.items()
+            for _, nd in r.get("networks", {}).items()
+            if (nd.get("contract") or "").strip()
+        )
+        log.info("[%s] currencies refreshed: %d assets (%d named, %d net-refs w/contract)",
+                 norm_id, len(result), len(names), with_contract)
 
     def names_snapshot(self) -> dict:
         """{eid: {ASSET: name}} — used by universe builder."""

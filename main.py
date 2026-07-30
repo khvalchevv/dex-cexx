@@ -22,13 +22,17 @@ log = logging.getLogger("main")
 
 from exchanges import init_all, close_all
 from cex_watcher import CexPriceBook, watch_exchange_tickers
+from rest_poller import run_all as rest_poll_all
 from scanner import scan_loop
 from alerter import TelegramAlerter
 from currencies import CurrencyCache
 from blacklist import TokenBlacklist
 from universe import TokenUniverse, _norm as _norm_eid
 from dex_watcher import DexWatcher, DexPriceBook
+from dex_screener_watcher import DexScreenerWatcher, DexScreenerBook
 from dex_verify import DexVerifier
+import coingecko
+import coinmarketcap
 
 
 class _SuppressFutureNoise(logging.Filter):
@@ -89,8 +93,11 @@ async def main() -> None:
     blacklist = TokenBlacklist()
     universe = TokenUniverse()
     dex_book = DexPriceBook()
+    ds_book = DexScreenerBook()
     verifier = DexVerifier()
-    alerter = TelegramAlerter(currency_cache=currency_cache, blacklist=blacklist)
+    alerter = TelegramAlerter(currency_cache=currency_cache, blacklist=blacklist,
+                              cex_book=cex_book, dex_book=dex_book, ds_book=ds_book,
+                              universe=universe, exchanges=exchanges)
     await alerter.start()
 
     # Universe: use fresh on-disk copy if available, else build from a
@@ -101,19 +108,34 @@ async def main() -> None:
         universe.build_from_cache(currency_cache, currency_cache.names_snapshot())
         universe.save()
 
+    universe_tickers = universe.all_tickers()
+    log.info("universe: %d tickers to subscribe across %d exchanges",
+             len(universe_tickers), len(exchanges))
     tasks = [
-        asyncio.create_task(watch_exchange_tickers(eid, inst, cex_book, stop),
-                             name=f"ws-{eid}")
+        asyncio.create_task(
+            watch_exchange_tickers(eid, inst, cex_book, stop,
+                                    universe_tickers=universe_tickers),
+            name=f"ws-{eid}")
         for eid, inst in exchanges.items()
     ]
     tasks.append(asyncio.create_task(
         currency_cache.refresh_loop(exchanges, stop), name="currency-cache"))
     tasks.append(asyncio.create_task(
         universe.rebuild_loop(currency_cache,
-                               currency_cache.names_snapshot, stop),
+                               currency_cache.names_snapshot, stop,
+                               on_new_groups=alerter.notify_new_groups),
         name="universe-rebuild"))
     tasks.append(asyncio.create_task(
+        coingecko.refresh_loop(stop), name="coingecko"))
+    tasks.append(asyncio.create_task(
+        coinmarketcap.refresh_loop(stop), name="coinmarketcap"))
+    tasks.append(asyncio.create_task(
+        rest_poll_all(exchanges, cex_book, universe_tickers, stop),
+        name="rest-poller"))
+    tasks.append(asyncio.create_task(
         DexWatcher(universe, dex_book).run(stop), name="dex-watcher"))
+    tasks.append(asyncio.create_task(
+        DexScreenerWatcher(universe, ds_book).run(stop), name="ds-watcher"))
     tasks.append(asyncio.create_task(
         scan_loop(cex_book, universe, alerter.send,
                    min_spread_pct=MIN_SPREAD,
@@ -122,6 +144,7 @@ async def main() -> None:
                    cooldown_sec=COOLDOWN,
                    blacklist=blacklist,
                    dex_book=dex_book,
+                   ds_book=ds_book,
                    verifier=verifier,
                    stop_event=stop),
         name="scanner"))

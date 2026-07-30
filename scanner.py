@@ -65,6 +65,10 @@ DEX_SANITY_RATIO = float(os.getenv("DEX_SANITY_RATIO", "4"))
 # file may be hours old; the refresh loop re-prices within ~20s, so until then
 # those entries are skipped rather than compared at a stale price.
 DEX_MAX_AGE_SEC = int(os.getenv("DEX_MAX_AGE_SEC", "300"))
+# DexScreener refreshes every 30 min by default; allow 1 h of tolerance
+# before treating entries as stale. Per-candidate verifier re-hits DS live
+# before alerting so a stale price never reaches TG anyway.
+DS_MAX_AGE_SEC = int(os.getenv("DS_MAX_AGE_SEC", "3600"))          # 1h
 # A group is one token (contract-grouped), so every venue should price near
 # the same level. A DEX price diverging from the dominant CEX price by more
 # than this factor is a wrong/dead contract the CEX mis-reported (e.g. OKX
@@ -149,7 +153,13 @@ async def scan_once(cex_book: CexPriceBook, universe, min_spread_pct: float,
         if dex_snap is not None:
             for e in (dex_snap.get(gid) or {}).values():
                 p = e.get("priceUsd")
-                if not p or now - e.get("ts", 0) >= DEX_MAX_AGE_SEC:
+                if not p:
+                    continue
+                # OKX entries refresh ~80s (DEX_MAX_AGE_SEC=300s tolerance);
+                # DexScreener bulk refresh is ~3h (DS_MAX_AGE_SEC=4h tolerance).
+                max_age = (DEX_MAX_AGE_SEC if e.get("dex") == "OKX"
+                           else DS_MAX_AGE_SEC)
+                if now - e.get("ts", 0) >= max_age:
                     continue
                 if dom_ref > 0:
                     ratio = max(p, dom_ref) / max(min(p, dom_ref), 1e-12)
@@ -198,21 +208,29 @@ async def scan_once(cex_book: CexPriceBook, universe, min_spread_pct: float,
             "cex": cexv, "dex": dexv, "listings": group["listings"],
         })
 
-    # Verify each candidate's DEX leg against DexScreener (concurrently, cached):
-    # the OKX price may come from a phantom pool (no real on-chain market),
-    # a wrong-token contract, or a dead/illiquid pool. OKX stays the price
-    # source — DexScreener only confirms the leg is a real, liquid pool of THIS
-    # token. Candidates that fail are dropped. No price ratios involved.
+    # Verify each candidate's DEX leg against TWO independent sources in parallel
+    # (concurrently across all candidates, both verifiers per leg, cached):
+    #   * DexScreener — pool exists + liquidity + volume + symbol identity match.
+    #   * KyberSwap   — executable USDC->token swap quote via 420+ aggregated
+    #                   DEXes (only for chains Kyber covers — EVM).
+    # Policy: a DEX leg passes only if DexScreener verifies AND, when Kyber
+    # supports the chain, Kyber also verifies. For non-EVM (solana/tron/ton/...)
+    # Kyber returns no opinion and the leg is trusted on DexScreener alone.
+    # OKX stays the price source — verifiers don't replace prices.
     if verifier is not None and alerts:
+        async def _leg_ok(leg, ticker, display) -> bool:
+            if leg["kind"] != "dex":
+                return True
+            chain = leg.get("chain")
+            contract = leg.get("contract")
+            return await verifier.verify(chain, contract, ticker, display)
+
         async def _ok(a) -> bool:
             for leg in (a["buy"], a["sell"]):
-                if leg["kind"] != "dex":
-                    continue
-                v = await verifier.verify(leg.get("chain"), leg.get("contract"),
-                                          a["ticker"], a["display"])
-                if not v:
+                if not await _leg_ok(leg, a["ticker"], a["display"]):
                     return False
             return True
+
         verdicts = await asyncio.gather(*[_ok(a) for a in alerts])
         alerts = [a for a, ok in zip(alerts, verdicts) if ok]
 
@@ -227,6 +245,7 @@ async def scan_loop(cex_book: CexPriceBook, universe, on_alert,
                      cooldown_sec: int = 300,
                      blacklist=None,
                      dex_book=None,
+                     ds_book=None,
                      verifier=None,
                      stop_event: asyncio.Event | None = None) -> None:
     if stop_event is None:
@@ -248,7 +267,21 @@ async def scan_loop(cex_book: CexPriceBook, universe, on_alert,
         await asyncio.sleep(interval_sec)
         if not universe.groups:
             continue
-        dex_snap = await dex_book.snapshot() if dex_book is not None else None
+        # Merge OKX (fast, ~80s cycle) + DexScreener (slow, ~3h cycle) DEX
+        # books into a single per-gid snapshot. Both share the same entry
+        # shape; on a chain+contract collision the OKX entry wins (newer
+        # price). DS adds coverage on contracts OKX can't see.
+        okx_snap = await dex_book.snapshot() if dex_book is not None else {}
+        ds_snap = await ds_book.snapshot() if ds_book is not None else {}
+        if okx_snap or ds_snap:
+            dex_snap = {}
+            for gid in (set(okx_snap) | set(ds_snap)):
+                merged = dict(ds_snap.get(gid, {}))
+                merged.update(okx_snap.get(gid, {}))               # OKX overrides
+                if merged:
+                    dex_snap[gid] = merged
+        else:
+            dex_snap = None
         try:
             alerts = await scan_once(cex_book, universe, min_spread_pct,
                                       max_age_sec, blacklist=blacklist,

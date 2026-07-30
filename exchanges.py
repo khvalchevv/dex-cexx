@@ -15,16 +15,16 @@ PROXIES_FILE = os.path.join(_HERE, "proxies.txt")
 TARGET_EXCHANGES = [
     # native bulk watchTickers
     "binance", "bybit", "okx", "kucoin", "mexc", "bitget", "gateio",
-    "bingx", "kraken", "bitmart",
+    "bingx", "kraken",
     "coinbaseadvanced", "cryptocom", "phemex", "whitebit",
-    "coinex", "xt", "exmo", "poloniex",
-    "bitvavo", "hitbtc",
-    "upbit", "bithumb", "p2b",
+    "coinex", "xt",
     # WS only via per-symbol watchOrderBook (top-of-book extracted)
-    "htx", "bitfinex", "lbank", "hashkey",
-    "bitstamp", "bitrue", "ascendex",
+    "lbank", "bitrue",
 ]
-# Excluded: probit (403), coinone (KRW-only).
+# Excluded (user-disabled):
+#   poloniex, bitmart, exmo, bitstamp, hashkey, bitfinex, hitbtc, htx, ascendex,
+#   bitvavo (geo-block), bithumb (KRW-only), upbit (KRW-only), p2b (bad endpoint),
+#   probit (403), coinone (KRW-only).
 # Not in ccxt.pro 4.4.50 — need custom WS client later:
 #   digifinex, bigone, latoken, orangex
 
@@ -69,13 +69,30 @@ _KEY_MAP = {
 }
 
 
-def _build_inst(ccxt_id: str, cfg: dict, proxies: list[str]) -> ccxtpro.Exchange:
+def _build_inst(ccxt_id: str, cfg: dict, proxies: list[str],
+                 use_proxy: bool = True) -> ccxtpro.Exchange:
     inst = getattr(ccxtpro, ccxt_id)(cfg)
     if ccxt_id in ("bybit", "gateio", "bingx", "lbank", "phemex", "htx"):
         inst.options["defaultType"] = "spot"
     # okx & bitget expect fetchMarkets as a list of type strings.
     if ccxt_id in ("okx", "bitget"):
         inst.options["fetchMarkets"] = ["spot"]
+    # okx ccxt bug: parse_market crashes on some instruments where baseCcy=None.
+    # Wrap the class-level parse_market to skip malformed entries.
+    if ccxt_id == "okx":
+        _orig_parse_market = inst.parse_market
+        def _safe_parse_market(m, *a, **kw):
+            if not (m.get("baseCcy") and m.get("quoteCcy")):
+                return None
+            return _orig_parse_market(m, *a, **kw)
+        inst.parse_market = _safe_parse_market  # type: ignore[method-assign]
+        # And filter None out of parse_markets result
+        _orig_parse_markets = inst.parse_markets
+        def _safe_parse_markets(mkts, *a, **kw):
+            filtered = [m for m in (mkts or [])
+                        if m.get("baseCcy") and m.get("quoteCcy")]
+            return _orig_parse_markets(filtered, *a, **kw)
+        inst.parse_markets = _safe_parse_markets  # type: ignore[method-assign]
     # mexc & htx expect a dict with a "types" sub-key.
     if ccxt_id in ("mexc", "htx"):
         inst.options["fetchMarkets"] = {
@@ -89,7 +106,7 @@ def _build_inst(ccxt_id: str, cfg: dict, proxies: list[str]) -> ccxtpro.Exchange
     if ccxt_id == "coinbaseadvanced":
         inst.options["fetchMarketsFromAllAccounts"] = False
         inst.options["fetchFees"] = False
-    if proxies and ccxt_id not in EXCH_WITH_KEYS:
+    if use_proxy and proxies and ccxt_id not in EXCH_WITH_KEYS:
         inst.aiohttp_proxy = random.choice(proxies)
     return inst
 
@@ -101,7 +118,14 @@ async def _skip_currencies(*a, **kw):
     return {}
 
 
+INIT_MAX_ATTEMPTS = 4
+
+
 async def init_exchange(ccxt_id: str, keys: dict, proxies: list[str]) -> ccxtpro.Exchange | None:
+    """Load-markets an exchange with retries: try up to INIT_MAX_ATTEMPTS times
+    with a FRESH proxy each time. Most failures were proxy timeouts, not real
+    exchange problems — one dead proxy shouldn't nuke the whole exchange for
+    the rest of the session."""
     if not hasattr(ccxtpro, ccxt_id):
         log.warning("ccxt.pro does not support %s", ccxt_id)
         return None
@@ -109,50 +133,50 @@ async def init_exchange(ccxt_id: str, keys: dict, proxies: list[str]) -> ccxtpro
                 "options": {"fetchCurrencies": False}}
     k = keys.get(_KEY_MAP.get(ccxt_id, ""), {})
 
-    # Researcher pattern: build instance WITHOUT keys in cfg so ccxt doesn't
-    # decide to hit private endpoints during load_markets, then attach keys
-    # manually afterwards. Also monkey-patch fetch_currencies to no-op — our
-    # currencies.py uses direct REST for the venues that need auth.
-    inst = _build_inst(ccxt_id, dict(base_cfg), proxies)
-    # Stash the real fetch_currencies so currencies.py can still call it on demand.
-    inst._real_fetch_currencies = inst.fetch_currencies  # type: ignore[attr-defined]
-    inst.fetch_currencies = _skip_currencies  # type: ignore[method-assign]
-    if k.get("apiKey"):
-        inst.apiKey = k["apiKey"]
-        inst.secret = k["secret"]
-        if "password" in k:
-            inst.password = k["password"]
-    try:
-        await inst.load_markets()
-    except Exception as e:
-        err = str(e)[:120]
-        log.warning("FAIL %-20s (with keys): %s", ccxt_id, err)
-        try:
-            await inst.close()
-        except Exception:
-            pass
-        # Retry without keys — for market data we don't need auth.
-        if k.get("apiKey"):
-            log.info("retry %-20s without keys", ccxt_id)
-            inst = _build_inst(ccxt_id, dict(base_cfg), proxies)
-            inst._real_fetch_currencies = inst.fetch_currencies  # type: ignore[attr-defined]
-            inst.fetch_currencies = _skip_currencies  # type: ignore[method-assign]
-            try:
-                await inst.load_markets()
-            except Exception as e2:
-                log.warning("FAIL %-20s (no keys): %s", ccxt_id, str(e2)[:120])
-                try:
-                    await inst.close()
-                except Exception:
-                    pass
-                return None
-            # Re-attach keys post-load so currencies.py direct REST still has them.
+    async def _try(with_keys: bool, use_proxy: bool):
+        inst = _build_inst(ccxt_id, dict(base_cfg), proxies, use_proxy=use_proxy)
+        inst._real_fetch_currencies = inst.fetch_currencies  # type: ignore[attr-defined]
+        inst.fetch_currencies = _skip_currencies  # type: ignore[method-assign]
+        if with_keys and k.get("apiKey"):
             inst.apiKey = k["apiKey"]
             inst.secret = k["secret"]
             if "password" in k:
                 inst.password = k["password"]
-        else:
-            return None
+        try:
+            await inst.load_markets()
+            return inst, None
+        except Exception as e:
+            try: await inst.close()
+            except Exception: pass
+            return None, str(e)[:120]
+
+    # Attempt sequence: direct → proxy retries. Direct is fastest & most
+    # reliable when the exchange isn't geo-blocked from us; proxies are the
+    # backup when a public endpoint refuses our residential IP.
+    last_err = ""
+    attempts = [(True, False)]                         # direct with keys
+    attempts += [(True, True)] * (INIT_MAX_ATTEMPTS - 1)  # proxied
+    for i, (with_keys, use_proxy) in enumerate(attempts, 1):
+        inst, err = await _try(with_keys=with_keys, use_proxy=use_proxy)
+        if inst is not None:
+            if i > 1:
+                log.info("OK %-20s loaded on attempt %d (proxy=%s)",
+                         ccxt_id, i, use_proxy)
+            break
+        last_err = err
+        if k.get("apiKey") and ("Unauthorized" in err or "401" in err
+                                 or "invalid" in err.lower()):
+            log.info("retry %-20s without keys (auth err)", ccxt_id)
+            inst, err = await _try(with_keys=False, use_proxy=use_proxy)
+            if inst is not None:
+                inst.apiKey = k["apiKey"]; inst.secret = k["secret"]
+                if "password" in k: inst.password = k["password"]
+                break
+            last_err = err
+    else:
+        log.warning("FAIL %-20s after %d attempts: %s",
+                    ccxt_id, len(attempts), last_err)
+        return None
     spot_count = sum(1 for m in inst.markets.values() if m.get("spot"))
     log.info("OK %-20s loaded (%d spot pairs)", ccxt_id, spot_count)
     return inst
